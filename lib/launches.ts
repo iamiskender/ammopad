@@ -161,6 +161,23 @@ const readLaunchState = async (event: CreatedEvent): Promise<LaunchRow> => {
 
 let cache: { at: number; rows: LaunchRow[] } | null = null;
 const CACHE_MS = 15_000;
+/** Last good state per curve, used when a public RPC read is rate limited. */
+const lastGood = new Map<string, LaunchRow>();
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const readWithRetry = async (event: CreatedEvent): Promise<LaunchRow | null> => {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const row = await readLaunchState(event);
+      lastGood.set(event.curve.toLowerCase(), row);
+      return row;
+    } catch {
+      await sleep(400 * (attempt + 1));
+    }
+  }
+  return lastGood.get(event.curve.toLowerCase()) ?? null;
+};
 
 export const getLaunches = async (): Promise<LaunchRow[]> => {
   if (cache && Date.now() - cache.at < CACHE_MS) return cache.rows;
@@ -170,8 +187,8 @@ export const getLaunches = async (): Promise<LaunchRow[]> => {
   const sorted = [...unique.values()].sort((a, b) => (a.block > b.block ? -1 : a.block < b.block ? 1 : 0));
   const rows: LaunchRow[] = [];
   // Small sequential batches keep the public RPC within its rate limit.
-  for (let index = 0; index < sorted.length; index += 10) {
-    const batch = await Promise.all(sorted.slice(index, index + 10).map((event) => readLaunchState(event).catch(() => null)));
+  for (let index = 0; index < sorted.length; index += 3) {
+    const batch = await Promise.all(sorted.slice(index, index + 3).map(readWithRetry));
     rows.push(...batch.filter((row): row is LaunchRow => row !== null));
   }
   cache = { at: Date.now(), rows };
