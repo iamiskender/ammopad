@@ -119,64 +119,61 @@ const loadCreatedEvents = async (): Promise<CreatedEvent[]> => {
   return events;
 };
 
-const readLaunchState = async (event: CreatedEvent): Promise<LaunchRow> => {
-  const client = publicClient();
-  const pool = { address: event.curve, abi: ammoraLaunchPoolV4Abi } as const;
-  const token = { address: event.token, abi: erc20Abi } as const;
-  const [status, quoteReserve, threshold, canonicalPool, feeBps, name, symbol, decimals] = await Promise.all([
-    client.readContract({ ...pool, functionName: "status" }),
-    client.readContract({ ...pool, functionName: "quoteReserve" }),
-    client.readContract({ ...pool, functionName: "migrationQuoteThreshold" }),
-    client.readContract({ ...pool, functionName: "canonicalPool" }),
-    client.readContract({ ...pool, functionName: "currentFeeBps" }).catch(() => 0),
-    client.readContract({ ...token, functionName: "name" }).catch(() => "Unknown"),
-    client.readContract({ ...token, functionName: "symbol" }).catch(() => "???"),
-    client.readContract({ ...token, functionName: "decimals" }).catch(() => 9),
-  ]);
-  const statusNumber = Number(status);
-  const progressBps = statusNumber >= 2
-    ? 10_000
-    : threshold > 0n ? Number((quoteReserve * 10_000n) / threshold > 10_000n ? 10_000n : (quoteReserve * 10_000n) / threshold) : 0;
-  return {
-    token: event.token,
-    curve: event.curve,
-    creator: event.creator,
-    configId: event.configId.toString(),
-    metadataURI: event.metadataURI,
-    metadata: parseMetadataUri(event.metadataURI),
-    name,
-    symbol,
-    decimals: Number(decimals),
-    createdBlock: event.block.toString(),
-    createdAt: event.time,
-    txHash: event.txHash,
-    status: statusNumber,
-    quoteReserve: quoteReserve.toString(),
-    migrationQuoteThreshold: threshold.toString(),
-    progressBps,
-    canonicalPool: canonicalPool && canonicalPool !== zeroAddress ? canonicalPool : null,
-    feeBps: Number(feeBps),
-  };
-};
+const POOL_FIELDS = ["status", "quoteReserve", "migrationQuoteThreshold", "canonicalPool", "currentFeeBps"] as const;
+const TOKEN_FIELDS = ["name", "symbol", "decimals"] as const;
 
 let cache: { at: number; rows: LaunchRow[] } | null = null;
 const CACHE_MS = 15_000;
-/** Last good state per curve, used when a public RPC read is rate limited. */
+/** Last good state per curve, used when a public RPC read fails. */
 const lastGood = new Map<string, LaunchRow>();
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const readWithRetry = async (event: CreatedEvent): Promise<LaunchRow | null> => {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const row = await readLaunchState(event);
-      lastGood.set(event.curve.toLowerCase(), row);
-      return row;
-    } catch {
-      await sleep(400 * (attempt + 1));
+/** Reads every launch in a few Multicall3 calls instead of hundreds of separate RPC requests. */
+const readLaunchStates = async (events: CreatedEvent[]): Promise<LaunchRow[]> => {
+  const client = publicClient();
+  const contracts = events.flatMap((event) => [
+    ...POOL_FIELDS.map((functionName) => ({ address: event.curve, abi: ammoraLaunchPoolV4Abi, functionName })),
+    ...TOKEN_FIELDS.map((functionName) => ({ address: event.token, abi: erc20Abi, functionName })),
+  ]);
+  const results = await client.multicall({ contracts: contracts as never[], allowFailure: true, batchSize: 4_096 });
+  const per = POOL_FIELDS.length + TOKEN_FIELDS.length;
+  const rows: LaunchRow[] = [];
+  events.forEach((event, index) => {
+    const slice = results.slice(index * per, index * per + per) as { status: "success" | "failure"; result?: unknown }[];
+    const value = <T,>(i: number, fallback: T): T => (slice[i]?.status === "success" ? (slice[i]!.result as T) : fallback);
+    if (slice[0]?.status !== "success" || slice[1]?.status !== "success" || slice[2]?.status !== "success") {
+      const previous = lastGood.get(event.curve.toLowerCase());
+      if (previous) rows.push(previous);
+      return;
     }
-  }
-  return lastGood.get(event.curve.toLowerCase()) ?? null;
+    const status = Number(value<number | bigint>(0, 0));
+    const quoteReserve = value<bigint>(1, 0n);
+    const threshold = value<bigint>(2, 0n);
+    const canonicalPool = value<Address>(3, zeroAddress);
+    const ratio = threshold > 0n ? (quoteReserve * 10_000n) / threshold : 0n;
+    const row: LaunchRow = {
+      token: event.token,
+      curve: event.curve,
+      creator: event.creator,
+      configId: event.configId.toString(),
+      metadataURI: event.metadataURI,
+      metadata: parseMetadataUri(event.metadataURI),
+      name: value<string>(5, "Unknown"),
+      symbol: value<string>(6, "???"),
+      decimals: Number(value<number>(7, 9)),
+      createdBlock: event.block.toString(),
+      createdAt: event.time,
+      txHash: event.txHash,
+      status,
+      quoteReserve: quoteReserve.toString(),
+      migrationQuoteThreshold: threshold.toString(),
+      progressBps: status >= 2 ? 10_000 : Number(ratio > 10_000n ? 10_000n : ratio),
+      canonicalPool: canonicalPool !== zeroAddress ? canonicalPool : null,
+      feeBps: Number(value<number>(4, 0)),
+    };
+    lastGood.set(event.curve.toLowerCase(), row);
+    rows.push(row);
+  });
+  return rows;
 };
 
 export const getLaunches = async (): Promise<LaunchRow[]> => {
@@ -185,11 +182,15 @@ export const getLaunches = async (): Promise<LaunchRow[]> => {
   const unique = new Map<string, CreatedEvent>();
   for (const event of events) unique.set(event.curve.toLowerCase(), event);
   const sorted = [...unique.values()].sort((a, b) => (a.block > b.block ? -1 : a.block < b.block ? 1 : 0));
-  const rows: LaunchRow[] = [];
-  // Small sequential batches keep the public RPC within its rate limit.
-  for (let index = 0; index < sorted.length; index += 3) {
-    const batch = await Promise.all(sorted.slice(index, index + 3).map(readWithRetry));
-    rows.push(...batch.filter((row): row is LaunchRow => row !== null));
+  let rows: LaunchRow[] = [];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      rows = await readLaunchStates(sorted);
+      break;
+    } catch (error) {
+      if (attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+    }
   }
   cache = { at: Date.now(), rows };
   return rows;
