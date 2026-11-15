@@ -35,7 +35,7 @@ export const publicClient = (): PublicClient => {
   if (!cached) {
     cached = createPublicClient({
       chain: giwaSepolia,
-      transport: http(RPC_URL, { batch: { batchSize: 50, wait: 16 }, retryCount: 2 }),
+      transport: http(RPC_URL, { batch: { batchSize: 8, wait: 16 }, retryCount: 3, retryDelay: 400 }),
     }) as PublicClient;
   }
   return cached;
